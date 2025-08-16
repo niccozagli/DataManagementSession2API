@@ -42,6 +42,159 @@ def _getenv_int_list(name, default_list):
 
 from dotenv import load_dotenv
 
+import os
+import numpy as np
+import pandas as pd
+
+def ensure_cascara_in_topn(
+    items_w: pd.DataFrame,
+    products_df: pd.DataFrame,
+    week: int,
+    launch_week: int,
+    topn: int = 5,
+    max_convert_share: float = 0.08,  # cap: convert at most 8% of cold-drink lines
+    rng: np.random.Generator | None = None,
+) -> pd.DataFrame:
+    """
+    Ensure Cascara Cold Brew appears in the weekly top-N by revenue for weeks >= launch.
+    We minimally convert some non-Cascara cold-drink lines into Cascara lines.
+
+    Keeps total rows/orders stable; only product_id/unit_price/line_amount on selected lines change.
+    """
+    if week < launch_week or items_w.empty:
+        return items_w
+
+    cascara_name = os.getenv("BB_CASCARA_NAME", "Cascara Cold Brew")
+    cascara_cat  = os.getenv("BB_CASCARA_CATEGORY", "Cold Drink")
+
+    # Look up Cascara product id & price
+    cascara_row = products_df.loc[products_df["name"] == cascara_name]
+    if cascara_row.empty:
+        return items_w
+    cascara_id = int(cascara_row["product_id"].iloc[0])
+    cascara_price = float(cascara_row["unit_price"].iloc[0])
+
+    # Identify cold-drink product ids (including Cascara)
+    cold_ids = set(products_df.loc[products_df["category"] == cascara_cat, "product_id"])
+    cold_ids.add(cascara_id)
+
+    # Current revenue by product
+    rev_by_prod = items_w.groupby("product_id")["line_amount"].sum().sort_values(ascending=False)
+    cascara_rev = float(rev_by_prod.get(cascara_id, 0.0))
+    if len(rev_by_prod) >= topn:
+        threshold = float(rev_by_prod.iloc[topn-1])  # revenue of Nth place
+    else:
+        threshold = 0.0
+
+    # Already in top-N? done.
+    if cascara_rev >= threshold:
+        return items_w
+
+    # Revenue gap to close (a tiny epsilon so it clearly beats the Nth)
+    gap = max(0.0, threshold - cascara_rev + 0.01)
+
+    items = items_w.copy()
+
+    # Candidate lines to convert: other cold drinks (not Cascara)
+    cand_mask = items["product_id"].isin(cold_ids) & (items["product_id"] != cascara_id)
+    cand_idx = items.index[cand_mask]
+    if len(cand_idx) == 0:
+        return items
+
+    # Conversion cap
+    max_convert = max(1, int(len(cand_idx) * max_convert_share))
+
+    # Prefer converting lines with larger qty first (fewer edits to reach gap)
+    cand = items.loc[cand_idx].copy()
+    cand["potential_add"] = cand["qty"] * cascara_price  # what Cascara would contribute
+    cand = cand.sort_values(["qty", "potential_add"], ascending=False)
+
+    added = 0.0
+    changed = 0
+    for idx in cand.index:
+        # Convert this line to Cascara
+        q = float(items.at[idx, "qty"])
+        items.at[idx, "product_id"] = cascara_id
+        items.at[idx, "unit_price"] = cascara_price
+        items.at[idx, "line_amount"] = q * cascara_price
+
+        added += q * cascara_price
+        changed += 1
+        if added >= gap or changed >= max_convert:
+            break
+
+    return items
+
+
+def _parse_float_list(s, default):
+    try:
+        return [float(x.strip()) for x in str(s).split(",")]
+    except Exception:
+        return default
+
+def boost_cascara_lines(
+    items_w: pd.DataFrame,
+    products_df: pd.DataFrame,
+    week: int,
+    launch_week: int,
+    rng: np.random.Generator,
+) -> pd.DataFrame:
+    """
+    Post-process one week's order_items to increase Cascara Cold Brew presence
+    in weeks >= launch_week by converting some non-Cascara cold-drink lines.
+    """
+    if week < launch_week or items_w.empty:
+        return items_w
+
+    cascara_name = os.getenv("BB_CASCARA_NAME", "Cascara Cold Brew")
+    cascara_cat  = os.getenv("BB_CASCARA_CATEGORY", "Cold Drink")
+
+    # Multipliers relative to week-5 baseline (e.g., [1.00, 1.25, 1.50, 1.75])
+    mults = _parse_float_list(os.getenv("BB_CASCARA_WEEKLY_MULTIPLIERS", "1.00,1.25,1.50,1.75"), [1.00,1.25,1.50,1.75])
+    idx = max(0, min(week - launch_week, len(mults)-1))
+    mult = mults[idx]
+
+    # Look up product ids/prices
+    cascara_row = products_df.loc[products_df["name"] == cascara_name]
+    if cascara_row.empty:
+        return items_w  # nothing to do if cascara isn't in the catalog
+    cascara_id = int(cascara_row["product_id"].iloc[0])
+    cascara_price = float(cascara_row["unit_price"].iloc[0])
+
+    cold_ids = set(products_df.loc[products_df["category"] == cascara_cat, "product_id"])
+    if cascara_id not in cold_ids:
+        cold_ids.add(cascara_id)
+
+    items = items_w.copy()
+
+    # Current counts
+    is_cascara = items["product_id"] == cascara_id
+    curr_cascara = int(is_cascara.sum())
+
+    # If Week 5 is the baseline, target_cascara = curr_cascara * mult
+    target_cascara = int(round(curr_cascara * mult))
+    to_convert = max(0, target_cascara - curr_cascara)
+
+    if to_convert == 0:
+        return items
+
+    # Candidates = other cold drinks (not Cascara)
+    candidates_mask = items["product_id"].isin(cold_ids) & (~is_cascara)
+    n_cand = int(candidates_mask.sum())
+    if n_cand <= 0:
+        return items
+
+    n_pick = min(to_convert, n_cand)
+    pick_idx = rng.choice(items.index[candidates_mask], size=n_pick, replace=False)
+
+    # Convert picked lines to Cascara: product_id + price + line_amount
+    items.loc[pick_idx, "product_id"] = cascara_id
+    items.loc[pick_idx, "unit_price"] = cascara_price
+    items.loc[pick_idx, "line_amount"] = items.loc[pick_idx, "qty"] * cascara_price
+
+    return items
+
+
 BRAND = _getenv_str("BB_BRAND", "Borough Brew")
 START_DATE = _getenv_date("BB_START_DATE", "2024-03-04")   # Monday
 NUM_WEEKS = _getenv_int('BB_NUM_WEEKS', 8)
@@ -336,17 +489,53 @@ def main():
 
     next_order_id = 1000; all_orders, all_items = [], []
     for w in range(1, NUM_WEEKS+1):
-        orders_w, items_w, next_order_id = gen_orders_for_week(rng, w, products_df, customers_df, next_order_id)
+        orders_w, items_w, next_order_id = gen_orders_for_week(
+            rng, w, products_df, customers_df, next_order_id
+        )
+
+        # Optional first step: smooth growth (if you added this earlier)
+        items_w = boost_cascara_lines(items_w, products_df, week=w, launch_week=LAUNCH_CASCARA_WEEK, rng=rng)
+
+        # >>> Ensure Cascara appears in top-5 from launch week onwards
+        items_w = ensure_cascara_in_topn(
+            items_w=items_w,
+            products_df=products_df,
+            week=w,
+            launch_week=LAUNCH_CASCARA_WEEK,
+            topn=5,
+            max_convert_share=0.08,
+            rng=rng,
+        )
+
+        # Recompute order totals after edits
+        totals = (
+            items_w.groupby("order_id", as_index=False)["line_amount"]
+                .sum().rename(columns={"line_amount": "total_amount"})
+        ) # type: ignore
+        orders_w = (
+            orders_w.drop(columns=["total_amount"], errors="ignore")
+                    .merge(totals, on="order_id", how="left")
+        )
+        orders_w["total_amount"] = orders_w["total_amount"].fillna(0.0)
+
+    # Now append/write as before...
+
+
+        # Append AFTER recomputing totals
         all_orders.append(orders_w); all_items.append(items_w)
+
+        # Write per-week CSVs and tiny samples
         write_csv(orders_w, paths.orders_week / f"{w}.csv")
         write_csv(items_w, paths.order_items_week / f"{w}.csv")
         write_json(orders_w.head(5).to_dict(orient="records"), Path(paths.out) / "sample" / "orders" / "week" / f"{w}.json")
         write_json(items_w.head(5).to_dict(orient="records"), Path(paths.out) / "sample" / "order_items" / "week" / f"{w}.json")
 
+    # Concatenate and write the all-weeks tables
     orders = pd.concat(all_orders, ignore_index=True); items  = pd.concat(all_items, ignore_index=True)
     write_csv(orders, paths.out / "orders" / "all.csv")
     write_csv(items,  paths.out / "order_items" / "all.csv")
 
+    # Stats JSONs per week (now reflect boosted Cascara)
     emit_schema_json(paths)
     for w in range(1, NUM_WEEKS+1):
         ow = orders[orders["week"] == w].copy(); iw = items[items["week"] == w].copy()
@@ -357,6 +546,7 @@ def main():
         write_json(stats_new_vs_returning(ow, customers_df, week=w), paths.stats_root / "new-vs-returning" / "week" / f"{w}.json")
 
     print(f"✅ Generated assets under: {paths.out.resolve()}")
+
 
 if __name__ == "__main__":
     main()
